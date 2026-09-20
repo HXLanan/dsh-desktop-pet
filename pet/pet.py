@@ -37,6 +37,7 @@ from typing import Dict, List, Optional
 from PyQt5.QtCore import QPoint, QTimer, Qt
 from PyQt5.QtGui import (
     QColor,
+    QCursor,
     QFont,
     QLinearGradient,
     QPainter,
@@ -52,7 +53,16 @@ from PyQt5.QtWidgets import QApplication, QMenu, QWidget
 
 #: Moods the pet understands. The DSH host half writes one of these into
 #: state.json; an unknown value falls back to "idle".
-KNOWN_MOODS = ("idle", "thinking", "working", "happy", "error", "sleep")
+#:
+#: `approval` and `question` are the two "the human is blocking the agent"
+#: states. They are listed first because they are ranked highest: a pet that
+#: keeps showing "working" while a permission dialog waits for an answer is
+#: actively misleading, and the whole point of the pet is to say when the run
+#: needs you.
+KNOWN_MOODS = ("approval", "question", "idle", "thinking", "working", "happy", "error", "sleep")
+
+#: Moods that mean the agent cannot proceed without the user.
+ATTENTION_MOODS = ("approval", "question")
 
 #: Mood used when state.json is missing or names something unknown.
 DEFAULT_MOOD = "idle"
@@ -61,6 +71,15 @@ DEFAULT_MOOD = "idle"
 #: folders carry their own pacing via frame count; this only drives the
 #: procedural placeholder so it still feels alive.
 PLACEHOLDER_FRAME_MS = 120
+
+#: Frames in the attention halo's breath cycle. More frames than the plain
+#: two-frame bob because a coarse pulse on a ring looks like a flicker.
+ATTENTION_PULSE_FRAMES = 8
+
+#: Frames in the one-shot poke reaction, and how fast they run. Short and
+#: snappy: a reaction should feel like a flinch, not a mood.
+POKE_FRAMES = 8
+POKE_FRAME_MS = 60
 
 
 # --------------------------------------------------------------------------
@@ -191,6 +210,10 @@ def draw_placeholder(mood: str, size: int, frame_index: int) -> QPixmap:
     painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
 
     # Per-mood palette: (body top, body bottom, eye color, accent).
+    #
+    # The two attention moods use saturated, warm-vs-cool distinct hues so they
+    # are unmistakable at a glance from across the desk — their whole job is to
+    # pull the eye when the agent is blocked.
     palette = {
         "idle": (QColor(120, 190, 255), QColor(80, 130, 240), QColor(28, 34, 48), None),
         "thinking": (QColor(186, 160, 255), QColor(130, 110, 235), QColor(28, 34, 48), None),
@@ -198,13 +221,20 @@ def draw_placeholder(mood: str, size: int, frame_index: int) -> QPixmap:
         "happy": (QColor(255, 210, 120), QColor(245, 165, 70), QColor(90, 55, 20), None),
         "error": (QColor(255, 150, 150), QColor(225, 95, 95), QColor(70, 20, 20), None),
         "sleep": (QColor(160, 170, 195), QColor(115, 125, 155), QColor(40, 45, 60), None),
+        # Blocked on a permission decision: amber, the universal "needs you".
+        "approval": (QColor(255, 196, 92), QColor(238, 148, 40), QColor(74, 44, 8), None),
+        # Waiting on an answer: cyan, distinct from both idle blue and approval.
+        "question": (QColor(120, 226, 240), QColor(58, 178, 205), QColor(16, 52, 64), None),
     }
     top, bottom, eye, accent = palette.get(mood, palette[DEFAULT_MOOD])
 
-    # Gentle bob: idle sleeps breathe slowly, working moves faster.
+    # Gentle bob: idle sleeps breathe slowly, working moves faster. The
+    # attention moods bob fastest so motion alone draws the eye even before the
+    # colour registers.
     speed = {
         "idle": 1.0, "thinking": 1.4, "working": 2.0,
         "happy": 2.6, "error": 1.2, "sleep": 0.5,
+        "approval": 2.8, "question": 2.4,
     }.get(mood, 1.0)
     bob = int(round((size * 0.018) * speed * (1 if frame_index % 2 == 0 else -1)))
 
@@ -253,11 +283,18 @@ def draw_placeholder(mood: str, size: int, frame_index: int) -> QPixmap:
             )
         painter.setPen(Qt.NoPen)
     else:
+        # Wider eyes for error; widest for the attention moods, which read as
+        # "alert and looking at you".
         scale_h = 1.25 if mood == "error" else 1.0
+        if mood in ATTENTION_MOODS:
+            scale_h = 1.4
+        # The question mood glances sideways, which is what makes it read as
+        # puzzled rather than merely alert.
+        offset_x = size * 0.035 if mood == "question" else 0
         painter.setBrush(eye)
         for x in (left_x, right_x):
             painter.drawEllipse(
-                int(x), int(eye_y), int(eye_w), int(eye_h * scale_h),
+                int(x + offset_x), int(eye_y), int(eye_w), int(eye_h * scale_h),
             )
 
     # Mouth: flat when idle, open when working, frown on error.
@@ -275,6 +312,13 @@ def draw_placeholder(mood: str, size: int, frame_index: int) -> QPixmap:
         painter.setPen(Qt.NoPen)
         painter.drawEllipse(
             int(size * 0.44), int(size * 0.62), int(size * 0.12), int(size * 0.10),
+        )
+    elif mood == "approval" or mood == "question":
+        # A small round mouth reads as a soft "oh?" rather than the idle line.
+        painter.setBrush(eye)
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(
+            int(size * 0.46), int(size * 0.63), int(size * 0.085), int(size * 0.085),
         )
     else:
         painter.drawArc(
@@ -299,12 +343,111 @@ def draw_placeholder(mood: str, size: int, frame_index: int) -> QPixmap:
             int(size * 0.20), int(size * 0.20),
         )
 
+    # Attention moods: a pulsing halo ring. This is the strongest available
+    # signal on a mostly-transparent window, and it reads from across a room
+    # without being a flashing distraction — a slow breath, not a strobe.
+    if mood in ATTENTION_MOODS:
+        import math
+
+        pulse = 0.5 + 0.5 * math.sin((frame_index % ATTENTION_PULSE_FRAMES)
+                                     / ATTENTION_PULSE_FRAMES * 2 * math.pi)
+        ring_alpha = int(70 + 110 * pulse)
+        ring_width = max(1.5, size * (0.018 + 0.010 * pulse))
+        ring_inset = size * (0.015 + 0.022 * pulse)
+        halo = QColor(top)
+        halo.setAlpha(ring_alpha)
+        ring_pen = painter.pen()
+        ring_pen.setColor(halo)
+        ring_pen.setWidthF(ring_width)
+        painter.setPen(ring_pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(
+            int(ring_inset), int(ring_inset + bob),
+            int(size - 2 * ring_inset), int(size - 2 * ring_inset - bob),
+        )
+        painter.setPen(Qt.NoPen)
+
+    painter.end()
+    return pixmap
+
+
+def draw_poke_frame(size: int, frame_index: int, total: int) -> QPixmap:
+    """
+    Draw one frame of the poke reaction.
+
+    The shape is a squash-and-stretch: the pet flinches inward, overshoots
+    outward, then eases back. Frames past the overshoot settle, so the strip
+    ends exactly where the resting pose sits and the hand-off back to the mood
+    animation is invisible.
+    """
+    import math
+
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
+    t = frame_index / max(1, total)
+    # The reaction is a damped spring that starts at full compression: the
+    # impact frame is the first thing the eye sees, which is what makes the
+    # click feel answered. Starting from rest instead would waste the one frame
+    # the user is actually looking at on a pose indistinguishable from idle.
+    decay = 1.0 - t
+    wobble = math.cos(t * 2.5 * math.pi) * decay * 0.30
+    squash = 1.0 + wobble
+    lateral = math.sin(t * 3.5 * math.pi) * decay * size * 0.05
+    # A vertical hop on the impact, damping out with the rest.
+    hop = math.sin(t * math.pi) * decay * size * 0.06
+
+    body_w = (size * 0.88) * squash
+    body_h = (size * 0.88) / squash
+    x = (size - body_w) / 2 + lateral
+    y = (size - body_h) / 2 - hop
+
+    gradient = QLinearGradient(0, y, 0, y + body_h)
+    gradient.setColorAt(0.0, QColor(255, 214, 140))
+    gradient.setColorAt(1.0, QColor(246, 166, 74))
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(gradient)
+    painter.drawEllipse(int(x), int(y), int(body_w), int(body_h))
+
+    painter.setPen(QColor(255, 255, 255, 80))
+    painter.setBrush(Qt.NoBrush)
+    painter.drawEllipse(int(x), int(y), int(body_w), int(body_h))
+
+    # Startled eyes: wide and short, riding the wobble.
+    eye = QColor(74, 44, 8)
+    eye_w = body_w * 0.11
+    eye_h = body_h * 0.13
+    eye_y = y + body_h * 0.40
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(eye)
+    painter.drawEllipse(int(x + body_w * 0.28), int(eye_y), int(eye_w), int(eye_h))
+    painter.drawEllipse(int(x + body_w * 0.56), int(eye_y), int(eye_w), int(eye_h))
+
+    # A round open mouth sells the little "oh!".
+    painter.drawEllipse(
+        int(x + body_w * 0.44), int(y + body_h * 0.62),
+        int(body_w * 0.11), int(body_h * 0.11),
+    )
+
     painter.end()
     return pixmap
 
 
 def build_placeholder_animation(mood: str, size: int) -> Animation:
-    """Two procedurally drawn frames are enough to suggest breathing."""
+    """
+    Build a placeholder animation for `mood`.
+
+    Most moods need only two frames to suggest breathing. The attention moods
+    drive a halo ring through a full cycle, so they get a longer strip — a
+    two-frame pulse on a ring reads as a flicker rather than a breath.
+    """
+    if mood in ATTENTION_MOODS:
+        frames = [draw_placeholder(mood, size, i) for i in range(ATTENTION_PULSE_FRAMES)]
+        return Animation(frames=frames, frame_ms=PLACEHOLDER_FRAME_MS)
     return Animation(frames=[draw_placeholder(mood, size, 0),
                              draw_placeholder(mood, size, 1)])
 
@@ -335,6 +478,19 @@ class PetWindow(QWidget):
         self._press_pos = QPoint()
         self._moved = False
 
+        # Alpha-sampling cache for hit testing, keyed by (mood, frame) so the
+        # per-pixel lookup runs once per displayed frame rather than per mouse
+        # move.
+        self._alpha_cache = None
+        self._alpha_cache_key = None
+
+        # Poke reaction: frames, and how many are left to play (0 = not
+        # playing). The last seen counter lets a poll tell a new poke from the
+        # same one still sitting in state.json.
+        self._poke_frames: List[QPixmap] = []
+        self._poke_frames_left = 0
+        self._last_poke_count = 0
+
         # Window flags: no frame, no taskbar entry, stay on top, never steal
         # focus from the user's work.
         self.setWindowFlags(
@@ -347,7 +503,13 @@ class PetWindow(QWidget):
         self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setWindowTitle("DSH Desktop Pet")
 
+        # Deliver mouse-move events even with no button held. Without this the
+        # cursor could only update while dragging, because Qt suppresses
+        # buttonless moves unless tracking is on.
+        self.setMouseTracking(True)
+
         self._build_animations()
+        self._build_poke_animation()
         self._resize_to_mood()
         self._restore_position()
 
@@ -385,18 +547,57 @@ class PetWindow(QWidget):
         return self.animations.get(self.mood) or self.animations[DEFAULT_MOOD]
 
     def _current_pixmap(self) -> Optional[QPixmap]:
+        # While the poke reaction plays it owns the frame; everything else
+        # (hit testing, painting, sizing) reads through here, so the special
+        # case lives in exactly one place.
+        if self._poke_frames_left > 0 and self._poke_frames:
+            index = min(self.frame_index, len(self._poke_frames) - 1)
+            return self._poke_frames[index]
         return self._current_animation().frame_at(self.frame_index)
 
     def _resize_to_mood(self) -> None:
         pixmap = self._current_pixmap()
         if pixmap is None:
             return
+        self._resize_for(pixmap)
+
+    def _resize_for(self, pixmap: QPixmap) -> None:
+        """Size the window to one frame, at the configured scale."""
         width = max(16, int(round(pixmap.width() * self.scale)))
         height = max(16, int(round(pixmap.height() * self.scale)))
         if (width, height) != (self.width(), self.height()):
             self.setFixedSize(width, height)
 
     # -- mood -------------------------------------------------------------
+
+    def _build_poke_animation(self) -> None:
+        """
+        Build the one-shot "you poked me" reaction.
+
+        Loaded from `<PetDir>/assets/poke/*.png` when supplied, otherwise drawn:
+        a quick squash-and-stretch with a startled expression, which reads as a
+        reaction rather than another mood.
+        """
+        frames = load_sprite_frames(self.pet_dir, "poke")
+        if frames:
+            self._poke_frames = frames
+            log_line(self.pet_dir, f"poke reaction: {len(frames)} sprite frame(s)")
+            return
+        size = 160
+        self._poke_frames = [draw_poke_frame(size, i, POKE_FRAMES) for i in range(POKE_FRAMES)]
+        log_line(self.pet_dir, f"poke reaction: {POKE_FRAMES} drawn frame(s)")
+
+    def _play_poke(self) -> None:
+        """Start the poke reaction once, from the first frame."""
+        if not self._poke_frames:
+            return
+        self._poke_frames_left = len(self._poke_frames)
+        self.frame_index = 0
+        self._resize_for(self._poke_frames[0])
+        # A snappier cadence than the mood loop: this is a reaction, not a
+        # resting state, so it should feel quick.
+        self.frame_timer.start(POKE_FRAME_MS)
+        self.update()
 
     def _apply_mood(self, mood: str, announce: bool = True) -> None:
         if mood not in self.animations:
@@ -410,13 +611,43 @@ class PetWindow(QWidget):
         if changed and announce:
             log_line(self.pet_dir, f"mood -> {mood}")
         self.update()
+        # A mood change can resize the window and reshape the silhouette.
+        self._refresh_cursor_if_inside()
 
     def _advance_frame(self) -> None:
+        # A poke reaction owns the frames while it plays, then hands control
+        # back to whatever mood is currently in effect.
+        if self._poke_frames_left > 0:
+            self._poke_frames_left -= 1
+            self.frame_index = (self.frame_index + 1) % max(1, len(self._poke_frames))
+            self.update()
+            self._refresh_cursor_if_inside()
+            if self._poke_frames_left == 0:
+                # Reaction finished: restore the mood's own animation.
+                self.frame_index = 0
+                self._resize_to_mood()
+                self.frame_timer.start(max(40, self._current_animation().frame_ms))
+                self.update()
+            return
+
         animation = self._current_animation()
         if not animation.frames:
             return
         self.frame_index = (self.frame_index + 1) % len(animation.frames)
         self.update()
+        # The silhouette may have changed shape between frames, so a pointer
+        # resting on an edge must be re-classified.
+        self._refresh_cursor_if_inside()
+
+    def _refresh_cursor_if_inside(self) -> None:
+        """Re-evaluate the cursor, but only while the mouse is over the pet."""
+        try:
+            if not self.underMouse() or self._dragging:
+                return
+            self._update_cursor(self.mapFromGlobal(QCursor.pos()))
+        except Exception:
+            # A cursor probe must never break the animation loop.
+            pass
 
     # -- position ---------------------------------------------------------
 
@@ -455,14 +686,76 @@ class PetWindow(QWidget):
 
     # -- interaction ------------------------------------------------------
 
+    def _hits_pet(self, pos: QPoint) -> bool:
+        """
+        Whether a widget-local point lands on a visible pixel of the pet.
+
+        The window is a transparent square around an arbitrary silhouette, so
+        treating the whole rect as the pet would show a pointing hand over empty
+        space. Sampling the frame's alpha keeps the cursor honest: the hand
+        appears only where the artwork actually is.
+
+        The lookup is memoised per frame because it runs on every mouse-move.
+        """
+        pixmap = self._current_pixmap()
+        if pixmap is None:
+            return False
+
+        width, height = self.width(), self.height()
+        if width <= 0 or height <= 0:
+            return False
+
+        # Map widget coordinates back onto the source pixmap.
+        x = int(pos.x() * pixmap.width() / width)
+        y = int(pos.y() * pixmap.height() / height)
+        if x < 0 or y < 0 or x >= pixmap.width() or y >= pixmap.height():
+            return False
+
+        # A pixmap without an alpha channel is fully opaque: every point hits.
+        if not pixmap.hasAlphaChannel():
+            return True
+
+        image = self._alpha_cache
+        if image is None or self._alpha_cache_key != (self.mood, self.frame_index):
+            image = pixmap.toImage()
+            self._alpha_cache = image
+            self._alpha_cache_key = (self.mood, self.frame_index)
+        # A generous threshold keeps anti-aliased silhouette edges clickable.
+        return image.pixelColor(x, y).alpha() > 8
+
+    def _update_cursor(self, pos: Optional[QPoint] = None) -> None:
+        """
+        Point the cursor at the pet while the mouse is over it.
+
+        A closed hand while dragging reads as "carrying the pet"; an open hand
+        while merely hovering reads as "this is clickable".
+        """
+        if self._dragging and self._moved:
+            self.setCursor(Qt.ClosedHandCursor)
+            return
+        if self._dragging:
+            self.setCursor(Qt.OpenHandCursor)
+            return
+        point = pos if pos is not None else self.mapFromGlobal(QCursor.pos())
+        self.setCursor(Qt.PointingHandCursor if self._hits_pet(point) else Qt.ArrowCursor)
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._update_cursor()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        # Hand the pointer back to whatever is underneath when we leave.
+        self.setCursor(Qt.ArrowCursor)
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.LeftButton:
             self._dragging = True
             self._moved = False
             self._press_pos = event.pos()
             self._drag_offset = event.pos()
+            self._update_cursor(event.pos())
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        self._update_cursor(event.pos())
         if not self._dragging:
             return
         delta = event.pos() - self._press_pos
@@ -475,6 +768,7 @@ class PetWindow(QWidget):
         if event.button() != Qt.LeftButton:
             return
         self._dragging = False
+        self._update_cursor(event.pos())
         if self._moved:
             self._save_position()
             merge_json(self.pet_file, {
@@ -483,14 +777,20 @@ class PetWindow(QWidget):
             })
             log_line(self.pet_dir, f"moved to {self.x()},{self.y()}")
         else:
-            # A click (not a drag) asks DSH to open the conversation.
+            # A click (not a drag) plays the poke reaction, right here and
+            # right now. Handling it locally is what makes the pet feel
+            # responsive: routing it through the browser half would add a
+            # poll-interval of latency to something that should be instant.
+            # The click counter is still recorded so the shell can observe
+            # clicks if it ever wants to.
+            self._play_poke()
             current = read_json(self.pet_file) or {}
             clicks = int(current.get("clicks", 0)) + 1
             merge_json(self.pet_file, {
                 "event": "click", "clicks": clicks,
                 "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             })
-            log_line(self.pet_dir, f"clicked (count={clicks}) -> request conversation")
+            log_line(self.pet_dir, f"poked (count={clicks})")
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802
         menu = QMenu(self)
@@ -523,6 +823,14 @@ class PetWindow(QWidget):
         mood = state.get("mood")
         if isinstance(mood, str) and mood and mood != self.mood:
             self._apply_mood(mood)
+
+        # A poke is a counter, not a flag: only a value higher than the last
+        # one seen is a new poke, so the same entry sitting in the file does
+        # not replay the reaction on every poll.
+        pokes = state.get("pokes")
+        if isinstance(pokes, int) and pokes > self._last_poke_count:
+            self._last_poke_count = pokes
+            self._play_poke()
 
         if "visible" in state:
             want = bool(state.get("visible"))
